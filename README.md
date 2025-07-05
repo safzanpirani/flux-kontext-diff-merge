@@ -15,7 +15,7 @@ A ComfyUI custom node that preserves image quality by selectively merging only t
 
 ### Method 1: Git Clone (Recommended)
 1. `cd ComfyUI/custom_nodes/`
-2. `git clone https://github.com/yourusername/flux-kontext-diff-merge.git`
+2. `git clone https://github.com/safzanpirani/flux-kontext-diff-merge.git`
 3. Launch ComfyUI.
 
 
