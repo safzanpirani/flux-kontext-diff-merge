@@ -14,12 +14,10 @@ A ComfyUI custom node that preserves image quality by selectively merging only t
 ## Installation
 
 ### Method 1: Git Clone (Recommended)
-```bash
-cd ComfyUI/custom_nodes/
-git clone https://github.com/yourusername/flux-kontext-diff-merge.git
-cd flux-kontext-diff-merge
-pip install -r requirements.txt
-```
+1. `cd ComfyUI/custom_nodes/`
+2. `git clone https://github.com/yourusername/flux-kontext-diff-merge.git`
+3. Launch ComfyUI.
+
 
 ### Method 2: Manual Installation
 1. Create folder: `ComfyUI/custom_nodes/flux-kontext-diff-merge`
@@ -41,9 +39,9 @@ pip install -r requirements.txt
 
 ![Node Preview](docs/node.png)
 
-#### Required
-- **`original_image`**: The original image before AI editing
-- **`edited_image`**: The AI-edited image from Flux Kontext Dev
+#### Required Inputs
+- **`original_image`** (IMAGE): Connect from your FluxKontextImageScale node
+- **`edited_image`** (IMAGE): Connect from your VAEDecode node
 
 #### Parameters
 - **`sensitivity`** (0.01-1.0, default: 0.02): Controls change detection sensitivity
