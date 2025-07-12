@@ -8,6 +8,39 @@ import comfy.model_management as model_management
 
 
 class FluxKontextDiffMerge:
+    """Flux Kontext Diff Merge
+
+    This node compares an *original* image against an *edited* image, detects the
+    regions that have changed, builds a refined mask, then blends the edited
+    pixels back onto the original using one of several blending strategies.
+
+    The most common workflow is:
+      1. Render an image (original)
+      2. Send it to an img-to-img pipeline where you repaint/erase parts
+      3. Feed *both* images into this node so only the modified areas are
+         re-inserted into the original with clean edges.
+
+    Parameter Overview
+    ------------------
+    • Change Threshold –  Controls how sensitive the detector is.  Lower = pick up
+      even small colour shifts; higher = only obvious changes.
+    • Detection Method –  Algorithm used to build the initial difference mask.
+        – adaptive  (LAB colour threshold + global-aware)
+        – color_diff (RGB channel diff)
+        – ssim       (structural similarity)
+        – combined   (adaptive OR edge-aware)
+    • Blend Method – How to merge the edited pixels back in.
+        – poisson    Seamless-clone (best when mask is tidy)
+        – alpha      Simple linear alpha composite (fast & safe fallback)
+        – multiband  Laplacian pyramid blend for smooth transitions
+        – gaussian   Distance-weighted alpha ramp
+    • Mask Blur – Gaussian blur radius (pixels) applied to improve soft edges.
+    • Mask Expand – Dilate mask by n pixels before blur (helps cover halos).
+    • Edge Feather – Extra fine feather after blur for subtle fades.
+    • Min Change Area – Ignore isolated specks below this size (pixel²).
+    • Global Threshold – If the entire image shifted (eg colour grade) the
+      adaptive detector automatically relaxes; this scalar lets you tune that.
+    """
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -20,48 +53,56 @@ class FluxKontextDiffMerge:
                     "max": 1.0,
                     "step": 0.01,
                     "display": "slider",
-                    "label": "Change Threshold"
+                    "label": "Change Threshold",
+                    "tooltip": "Sensitivity of change detection; lower values detect more subtle changes"
                 }),
                 "detection_method": (["adaptive", "color_diff", "ssim", "combined"], {
-                    "default": "adaptive"
+                    "default": "adaptive",
+                    "tooltip": "Algorithm used to build the initial mask of differences"
                 }),
                 "blend_method": (["poisson", "alpha", "multiband", "gaussian"], {
-                    "default": "poisson"
+                    "default": "poisson",
+                    "tooltip": "How to merge the edited pixels back onto the original"
                 }),
                 "mask_blur": ("INT", {
                     "default": 15,
                     "min": 1,
                     "max": 100,
-                    "step": 1
+                    "step": 1,
+                    "tooltip": "Gaussian blur radius (in pixels) applied to the mask to soften edges"
                 }),
                 "mask_expand": ("INT", {
                     "default": 8,
                     "min": 0,
                     "max": 50,
-                    "step": 1
+                    "step": 1,
+                    "tooltip": "Dilate the detected mask by this many pixels before blurring"
                 }),
                 "edge_feather": ("INT", {
                     "default": 15,
                     "min": 0,
                     "max": 50,
-                    "step": 1
+                    "step": 1,
+                    "tooltip": "Additional feathering (fine Gaussian) after the main blur"
                 }),
                 "min_change_area": ("INT", {
                     "default": 250,
                     "min": 0,
                     "max": 5000,
-                    "step": 10
+                    "step": 10,
+                    "tooltip": "Ignore change blobs smaller than this area (pixel²)"
                 }),
                 "global_threshold": ("FLOAT", {
                     "default": 0.15,
                     "min": 0.01,
                     "max": 0.5,
                     "step": 0.01,
-                    "display": "slider"
+                    "display": "slider",
+                    "tooltip": "Controls how aggressively the adaptive detector compensates for global shifts"
                 }),
             },
             "optional": {
-                "manual_mask": ("MASK",),
+                "manual_mask": ("MASK", {"tooltip": "User-supplied 1-channel mask (black/white) to override automatic detection"}),
             }
         }
     
@@ -423,7 +464,13 @@ class FluxKontextDiffMerge:
 
         batch_size = len(original_list)
         if batch_size != len(edited_list):
-            raise ValueError(f"Original and edited image batch sizes differ: {batch_size} vs {len(edited_list)}")
+            # Allow broadcast when original has 1 image and edited has multiple
+            if batch_size == 1 and len(edited_list) > 1:
+                print(f"Broadcasting single original image to match edited batch of size {len(edited_list)}")
+                original_list = original_list * len(edited_list)
+                batch_size = len(edited_list)
+            else:
+                raise ValueError(f"Original and edited image batch sizes differ: {batch_size} vs {len(edited_list)}")
 
         # Prepare manual mask list if provided
         manual_mask_list = None
