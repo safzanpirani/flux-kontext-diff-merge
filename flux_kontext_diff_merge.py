@@ -286,17 +286,14 @@ class FluxKontextDiffMerge:
                     print("Poisson blending failed: contour too small, falling back to alpha blending")
                     return self.alpha_blend(source, target, mask)
                 
-                M = cv2.moments(largest_contour)
-                if M["m00"] != 0:
-                    center_x = int(M["m10"] / M["m00"])
-                    center_y = int(M["m01"] / M["m00"])
-                    
-                    # Ensure center is within image bounds
-                    center_x = max(1, min(center_x, source.shape[1] - 2))
-                    center_y = max(1, min(center_y, source.shape[0] - 2))
-                    center = (center_x, center_y)
-                else:
-                    center = (source.shape[1] // 2, source.shape[0] // 2)
+                # Use bounding rectangle center instead of image moments to avoid occasional dislocation
+                x, y, w, h = cv2.boundingRect(largest_contour)
+                center_x = x + w // 2
+                center_y = y + h // 2
+                # Clip center to image bounds                         
+                center_x = max(1, min(center_x, source.shape[1] - 2))
+                center_y = max(1, min(center_y, source.shape[0] - 2))
+                center = (center_x, center_y)
             else:
                 center = (source.shape[1] // 2, source.shape[0] // 2)
             
