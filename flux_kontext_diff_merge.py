@@ -87,6 +87,39 @@ class FluxKontextDiffMerge:
             numpy_array = np.expand_dims(numpy_array, axis=0)
         return torch.from_numpy(numpy_array)
     
+    def tensor_to_numpy_list(self, tensor):
+        """Convert a (batched) ComfyUI tensor to a list of HxWxC uint8 numpy arrays"""
+        # Ensure we are working on CPU
+        tensor_cpu = tensor.detach().cpu()
+        # ComfyUI uses NHWC tensors (batch, height, width, channels)
+        if len(tensor_cpu.shape) == 4:
+            batch = tensor_cpu.shape[0]
+            imgs = []
+            for i in range(batch):
+                img = tensor_cpu[i].numpy()
+                if img.dtype != np.uint8:
+                    img = (img * 255.0).astype(np.uint8)
+                imgs.append(img)
+            return imgs
+        else:
+            img = tensor_cpu.numpy()
+            if img.dtype != np.uint8:
+                img = (img * 255.0).astype(np.uint8)
+            return [img]
+
+    def numpy_list_to_tensor(self, np_list):
+        """Convert list of HxWxC uint8/float numpy arrays to a batched ComfyUI tensor"""
+        tensor_list = []
+        for arr in np_list:
+            if arr.dtype == np.uint8:
+                arr = arr.astype(np.float32) / 255.0
+            if len(arr.shape) == 3:
+                arr = np.expand_dims(arr, axis=0)  # Add batch dim
+            tensor_list.append(torch.from_numpy(arr))
+        if len(tensor_list) == 0:
+            raise ValueError("numpy_list_to_tensor received an empty list")
+        return torch.cat(tensor_list, dim=0)
+    
     def adaptive_detection(self, original, edited, threshold=0.02, global_threshold=0.15):
         """Adaptive detection that's robust to global changes"""
         # Convert to LAB color space for better perceptual differences
@@ -386,61 +419,87 @@ class FluxKontextDiffMerge:
     def merge_diff(self, original_image, edited_image, threshold, detection_method,
                    blend_method, mask_blur, mask_expand, edge_feather, 
                    min_change_area, global_threshold, manual_mask=None):
-        
-        # Convert tensors to numpy
-        original_np = self.tensor_to_numpy(original_image)
-        edited_np = self.tensor_to_numpy(edited_image)
-        
-        # Ensure images are the same size
-        if original_np.shape != edited_np.shape:
-            print(f"Resizing edited image from {edited_np.shape} to {original_np.shape}")
-            edited_np = cv2.resize(edited_np, (original_np.shape[1], original_np.shape[0]))
-        
-        # Ensure minimum image dimensions
-        if original_np.shape[0] < 10 or original_np.shape[1] < 10:
-            print(f"Warning: Image dimensions are very small: {original_np.shape}")
-        
-        # Ensure mask dimensions match images
+        """Main entry point – now supports batched inputs"""
+        # Convert input tensors (possibly batched) to lists of numpy images
+        original_list = self.tensor_to_numpy_list(original_image)
+        edited_list = self.tensor_to_numpy_list(edited_image)
+
+        batch_size = len(original_list)
+        if batch_size != len(edited_list):
+            raise ValueError(f"Original and edited image batch sizes differ: {batch_size} vs {len(edited_list)}")
+
+        # Prepare manual mask list if provided
+        manual_mask_list = None
         if manual_mask is not None:
-            mask_np = (manual_mask[0].cpu().numpy() * 255).astype(np.uint8)
-            if mask_np.shape != original_np.shape[:2]:
-                print(f"Resizing manual mask from {mask_np.shape} to {original_np.shape[:2]}")
-                mask_np = cv2.resize(mask_np, (original_np.shape[1], original_np.shape[0]))
-        
-        # Use manual mask if provided, otherwise detect changes
-        if manual_mask is not None:
-            mask = mask_np
-        else:
-            # Detect changes using selected method
-            mask = self.detect_changes(original_np, edited_np, threshold, detection_method, global_threshold)
-            
-            # Filter out small changes (likely noise)
-            if min_change_area > 0:
-                mask = self.filter_small_changes(mask, min_change_area)
-        
-        # Refine the mask
-        refined_mask = self.refine_mask(mask, mask_expand, mask_blur, edge_feather)
-        
-        # Blend images based on method
-        if blend_method == "poisson":
-            result = self.poisson_blend(edited_np, original_np, refined_mask)
-        elif blend_method == "alpha":
-            result = self.alpha_blend(edited_np, original_np, refined_mask)
-        elif blend_method == "multiband":
-            result = self.multiband_blend(edited_np, original_np, refined_mask)
-        elif blend_method == "gaussian":
-            result = self.gaussian_blend(edited_np, original_np, refined_mask)
-        else:
-            result = self.alpha_blend(edited_np, original_np, refined_mask)
-        
-        # Create preview
-        preview_diff = self.create_preview_diff(original_np, edited_np, refined_mask)
-        
-        # Convert back to tensors
-        result_tensor = self.numpy_to_tensor(result)
-        mask_tensor = torch.from_numpy(refined_mask.astype(np.float32) / 255.0).unsqueeze(0)
-        preview_tensor = self.numpy_to_tensor(preview_diff)
-        
+            # manual_mask tensor shape is likely (B, H, W)
+            manual_mask_np = manual_mask.detach().cpu().numpy()
+            if len(manual_mask_np.shape) == 3:  # Batched masks
+                manual_mask_list = [(manual_mask_np[i] * 255).astype(np.uint8) for i in range(manual_mask_np.shape[0])]
+            else:  # Single mask, broadcast
+                manual_mask_list = [(manual_mask_np * 255).astype(np.uint8)] * batch_size
+            if len(manual_mask_list) != batch_size:
+                # Resize/broadcast to match batch
+                manual_mask_list = (manual_mask_list * batch_size)[:batch_size]
+
+        # Containers for outputs
+        result_np_list = []
+        mask_np_list = []
+        preview_np_list = []
+
+        # Process each item in batch independently
+        for idx in range(batch_size):
+            original_np = original_list[idx]
+            edited_np = edited_list[idx]
+
+            # Ensure images are the same size per item
+            if original_np.shape != edited_np.shape:
+                print(f"Resizing edited image in batch index {idx} from {edited_np.shape} to {original_np.shape}")
+                edited_np = cv2.resize(edited_np, (original_np.shape[1], original_np.shape[0]))
+
+            # Handle manual mask if available
+            if manual_mask_list is not None:
+                mask = manual_mask_list[idx]
+                # Resize mask if needed
+                if mask.shape != original_np.shape[:2]:
+                    mask = cv2.resize(mask, (original_np.shape[1], original_np.shape[0]))
+            else:
+                # Detect changes
+                mask = self.detect_changes(original_np, edited_np, threshold, detection_method, global_threshold)
+                if min_change_area > 0:
+                    mask = self.filter_small_changes(mask, min_change_area)
+
+            # Refine mask
+            refined_mask = self.refine_mask(mask, mask_expand, mask_blur, edge_feather)
+
+            # Blend based on selected method
+            if blend_method == "poisson":
+                result_np = self.poisson_blend(edited_np, original_np, refined_mask)
+            elif blend_method == "alpha":
+                result_np = self.alpha_blend(edited_np, original_np, refined_mask)
+            elif blend_method == "multiband":
+                result_np = self.multiband_blend(edited_np, original_np, refined_mask)
+            elif blend_method == "gaussian":
+                result_np = self.gaussian_blend(edited_np, original_np, refined_mask)
+            else:
+                result_np = self.alpha_blend(edited_np, original_np, refined_mask)
+
+            # Preview diff
+            preview_np = self.create_preview_diff(original_np, edited_np, refined_mask)
+
+            # Collect outputs
+            result_np_list.append(result_np)
+            mask_np_list.append(refined_mask)
+            preview_np_list.append(preview_np)
+
+        # Convert outputs back to batched tensors
+        result_tensor = self.numpy_list_to_tensor(result_np_list)
+        mask_tensor_list = []
+        for m_np in mask_np_list:
+            m_float = (m_np.astype(np.float32) / 255.0)
+            mask_tensor_list.append(torch.from_numpy(np.expand_dims(m_float, axis=0)))  # add batch dim
+        mask_tensor = torch.cat(mask_tensor_list, dim=0)
+        preview_tensor = self.numpy_list_to_tensor(preview_np_list)
+
         return (result_tensor, mask_tensor, preview_tensor)
 
 
