@@ -44,7 +44,7 @@ A ComfyUI custom node that preserves image quality by selectively merging only t
 - **`edited_image`** (IMAGE): Connect from your VAEDecode node
 
 #### Parameters
-- **`sensitivity`** (0.01-1.0, default: 0.02): Controls change detection sensitivity
+- **`threshold`** (0.01-1.0, default: 0.02): Controls change detection threshold (increasing this reduces the size of the detected mask)
 - **`detection_method`**: Choose detection approach
   - **`adaptive`**: Best for AI-processed images (recommended)
   - `color_diff`: Simple color differences
@@ -73,7 +73,7 @@ A ComfyUI custom node that preserves image quality by selectively merging only t
 
 ### Object Replacement
 ```
-sensitivity: 0.02
+threshold: 0.02
 detection_method: "adaptive"
 global_threshold: 0.15
 min_change_area: 250
@@ -112,4 +112,18 @@ When Flux Kontext Dev processes an image, it introduces subtle changes throughou
 
 ## License
 
-MIT License - feel free to use and modify for your projects. 
+MIT License - feel free to use and modify for your projects.
+
+## Troubleshooting
+
+### Entire image shows red overlay
+1. **Increase** `global_threshold` to 0.20+
+2. **Increase** `threshold` to 0.03
+3. **Use** `detection_method: "adaptive"`
+4. **Increase** `min_change_area` to 500+
+
+### No changes detected
+1. **Decrease** `global_threshold` to 0.08
+2. **Decrease** `threshold` to 0.01
+3. **Decrease** `min_change_area` to 100
+4. **Check** the `preview_diff` output for debugging 
