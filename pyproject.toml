@@ -1,0 +1,38 @@
+[project]
+name = "flux-kontext-diff-merge"
+description = "ComfyUI custom node for diff-based image merging"
+version = "1.0.0"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [{ name = "Safzan Pirani" }]
+keywords = [
+  "ComfyUI", "image-processing", "poisson-blending", "diff-merge", "Flux", "Kontext"
+]
+classifiers = [
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: MIT License"
+]
+
+dependencies = ["opencv-python>=4.5.0", "scikit-image>=0.19.0", "numpy>=1.21.0", "scipy>=1.7.0", "pillow>=8.0.0"]
+
+[project.urls]
+Repository = "https://github.com/safzanpirani/flux-kontext-diff-merge"
+#  Used by Comfy Registry https://registry.comfy.org
+Documentation = "https://github.com/safzanpirani/flux-kontext-diff-merge/wiki"
+"Bug Tracker" = "https://github.com/safzanpirani/flux-kontext-diff-merge/issues"
+
+[tool]
+[tool.comfy]
+PublisherId = "safzanpirani"
+DisplayName = "Flux Kontext Diff Merge"
+Icon = ""
+includes = []
+requires-comfyui = ">=1.0.0"  # ComfyUI version compatibility
+
