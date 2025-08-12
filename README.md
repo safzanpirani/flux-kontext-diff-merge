@@ -10,6 +10,8 @@ A ComfyUI custom node that preserves image quality by selectively merging only t
 - **Multiple Blending Methods**: Poisson, alpha, multi-band, and Gaussian blending
 - **Intelligent Masking**: Automatic mask refinement with morphological operations
 - **Preview Capability**: Shows detected changes with visual overlay
+- **Batch Processing**: Processes full batches; broadcasts a single original over a multi-image edited batch
+- **Robust Poisson**: Stable center selection and safe padding when masks touch image edges
 
 ## Installation
 
@@ -69,6 +71,15 @@ A ComfyUI custom node that preserves image quality by selectively merging only t
 - **`difference_mask`**: The detected change mask
 - **`preview_diff`**: Preview showing detected changes highlighted in red
 
+### Batch Support
+
+This node fully supports batch workflows:
+
+- If `original_image` and `edited_image` have the same batch size, items are processed pairwise
+- If `original_image` has batch size 1 and `edited_image` > 1, the original is automatically broadcast to match the edited batch
+- `manual_mask` may be a single mask (broadcast) or a batch of masks; masks are resized per item to match image dimensions
+- All outputs (`merged_image`, `difference_mask`, `preview_diff`) are returned as batches
+
 ## Optimal Settings
 
 ### Object Replacement
@@ -82,6 +93,12 @@ mask_blur: 15
 mask_expand: 8
 edge_feather: 15
 ```
+
+### Poisson Blending Notes
+
+- Poisson now selects the blend center using a distance transform (most interior point) for stability across thresholds
+- If the mask touches the image border, the node performs reflect-padding under the hood and crops back, avoiding ROI errors and position jumps
+- Poisson internally treats masks as binary; for very soft edges, consider `multiband` or `gaussian`
 
 ## Results
 
@@ -127,3 +144,13 @@ MIT License - feel free to use and modify for your projects.
 2. **Decrease** `threshold` to 0.01
 3. **Decrease** `min_change_area` to 100
 4. **Check** the `preview_diff` output for debugging 
+
+### Batch shape mismatches
+1. If you pass a single original and a batched edited input, the node will broadcast the original automatically
+2. If you pass mismatched batch sizes otherwise, you will get an error; align batch sizes or use broadcasting as above
+
+## What's New
+
+- Batch processing with original-image broadcasting when edited batch > 1
+- Poisson blending is robust to edge-touching masks (reflect padding) and uses distance-transform center selection
+- Per-parameter tooltips and improved in-node documentation for easier tuning

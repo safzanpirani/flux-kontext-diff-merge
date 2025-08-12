@@ -303,67 +303,62 @@ class FluxKontextDiffMerge:
         return mask
     
     def poisson_blend(self, source, target, mask):
-        """Poisson blending for seamless integration"""
+        """Poisson blending for seamless integration (robust to edge masks)."""
         try:
             # Ensure inputs are valid
             if source.shape != target.shape:
                 print(f"Poisson blending failed: shape mismatch {source.shape} vs {target.shape}, falling back to alpha blending")
                 return self.alpha_blend(source, target, mask)
-            
+
+            # Build binary mask
             binary_mask = (mask > 127).astype(np.uint8) * 255
-            
-            # Check if mask has any valid regions
             if np.sum(binary_mask) == 0:
                 print("Poisson blending failed: empty mask, falling back to alpha blending")
                 return self.alpha_blend(source, target, mask)
-            
-            contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            if len(contours) > 0:
-                largest_contour = max(contours, key=cv2.contourArea)
-                
-                # Check if contour is large enough
-                if cv2.contourArea(largest_contour) < 10:
-                    print("Poisson blending failed: contour too small, falling back to alpha blending")
-                    return self.alpha_blend(source, target, mask)
-                
-                # Use bounding rectangle center instead of image moments to avoid occasional dislocation
-                x, y, w, h = cv2.boundingRect(largest_contour)
-                center_x = x + w // 2
-                center_y = y + h // 2
-                # Clip center to image bounds                         
-                center_x = max(1, min(center_x, source.shape[1] - 2))
-                center_y = max(1, min(center_y, source.shape[0] - 2))
-                center = (center_x, center_y)
-            else:
-                center = (source.shape[1] // 2, source.shape[0] // 2)
-            
-            # Validate that the center point is within the mask region
-            if binary_mask[center[1], center[0]] == 0:
-                # Find a valid point within the mask
-                mask_points = np.where(binary_mask > 0)
-                if len(mask_points[0]) > 0:
-                    center = (mask_points[1][0], mask_points[0][0])
-                else:
-                    print("Poisson blending failed: no valid mask points, falling back to alpha blending")
-                    return self.alpha_blend(source, target, mask)
-            
-            # Ensure mask boundaries don't touch image edges to avoid ROI issues
+
             h, w = binary_mask.shape
-            boundary_mask = binary_mask.copy()
-            boundary_mask[0, :] = 0
-            boundary_mask[-1, :] = 0
-            boundary_mask[:, 0] = 0
-            boundary_mask[:, -1] = 0
-            
-            # If mask touches edges, use alpha blending instead
-            if np.sum(boundary_mask) != np.sum(binary_mask):
-                print("Poisson blending failed: mask touches image boundaries, falling back to alpha blending")
-                return self.alpha_blend(source, target, mask)
-            
-            result = cv2.seamlessClone(source, target, boundary_mask, center, cv2.NORMAL_CLONE)
-            return result
-            
+
+            # Use an eroded mask to find a stable center (avoid threshold-induced drift)
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            inner_mask = cv2.erode(binary_mask, kernel, iterations=1)
+            if np.sum(inner_mask) == 0:
+                inner_mask = binary_mask
+
+            # Select center as the pixel farthest from the boundary (distance transform)
+            dist = cv2.distanceTransform((inner_mask > 0).astype(np.uint8), cv2.DIST_L2, 5)
+            cy, cx = np.unravel_index(np.argmax(dist), dist.shape)
+            if dist[cy, cx] <= 0:
+                # Fallback: bounding rect center
+                x, y, ww, hh = cv2.boundingRect(binary_mask)
+                cx = x + ww // 2
+                cy = y + hh // 2
+
+            # Clamp to safe interior for seamlessClone
+            cx = int(max(1, min(cx, w - 2)))
+            cy = int(max(1, min(cy, h - 2)))
+
+            # If mask touches any image border, pad images instead of failing
+            touches_edge = (
+                np.any(binary_mask[0, :]) or np.any(binary_mask[-1, :]) or
+                np.any(binary_mask[:, 0]) or np.any(binary_mask[:, -1])
+            )
+
+            if touches_edge:
+                pad = max(16, (max(h, w) // 100) * 2 + 8)  # dynamic-ish padding, min 16
+                src_p = cv2.copyMakeBorder(source, pad, pad, pad, pad, cv2.BORDER_REFLECT_101)
+                dst_p = cv2.copyMakeBorder(target, pad, pad, pad, pad, cv2.BORDER_REFLECT_101)
+                msk_p = cv2.copyMakeBorder(binary_mask, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
+
+                center = (cx + pad, cy + pad)
+                result_p = cv2.seamlessClone(src_p, dst_p, msk_p, center, cv2.NORMAL_CLONE)
+                # Crop back to original size
+                result = result_p[pad:pad + h, pad:pad + w]
+                return result
+            else:
+                center = (cx, cy)
+                result = cv2.seamlessClone(source, target, binary_mask, center, cv2.NORMAL_CLONE)
+                return result
+
         except Exception as e:
             print(f"Poisson blending failed: {e}, falling back to alpha blending")
             return self.alpha_blend(source, target, mask)
