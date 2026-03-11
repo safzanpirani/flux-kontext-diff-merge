@@ -1,10 +1,7 @@
-import torch
-import numpy as np
 import cv2
-from PIL import Image
+import numpy as np
+import torch
 from skimage.metrics import structural_similarity as ssim
-from scipy.ndimage import binary_dilation, binary_erosion
-import comfy.model_management as model_management
 
 
 class FluxKontextDiffMerge:
@@ -110,15 +107,76 @@ class FluxKontextDiffMerge:
     RETURN_NAMES = ("merged_image", "difference_mask", "preview_diff")
     FUNCTION = "merge_diff"
     CATEGORY = "image/postprocessing"
+
+    @staticmethod
+    def _to_uint8_image(array):
+        """Normalize an image array to uint8."""
+        if array.dtype == np.uint8:
+            return array
+        return np.clip(array * 255.0, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _to_uint8_mask(mask):
+        """Normalize a mask array to uint8."""
+        return np.clip(mask, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _kernel_size(radius):
+        """Convert a blur/expand radius to an OpenCV kernel size."""
+        radius = max(0, int(radius))
+        if radius == 0:
+            return 0
+        return radius * 2 + 1
+
+    @staticmethod
+    def _resize_mask(mask, target_shape):
+        """Resize a mask to match the target image shape."""
+        return cv2.resize(
+            mask,
+            (target_shape[1], target_shape[0]),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+    def _prepare_manual_mask_list(self, manual_mask, batch_size):
+        """Normalize manual mask tensors into a per-item uint8 mask list."""
+        if manual_mask is None:
+            return None
+
+        manual_mask_np = manual_mask.detach().cpu().numpy()
+        if manual_mask_np.ndim == 2:
+            masks = [self._to_uint8_mask(manual_mask_np * 255.0)]
+        elif manual_mask_np.ndim == 3:
+            masks = [
+                self._to_uint8_mask(manual_mask_np[index] * 255.0)
+                for index in range(manual_mask_np.shape[0])
+            ]
+        else:
+            raise ValueError(
+                f"Manual mask must have 2 or 3 dimensions, got {manual_mask_np.ndim}"
+            )
+
+        if len(masks) == 1:
+            return masks * batch_size
+        if len(masks) != batch_size:
+            return (masks * batch_size)[:batch_size]
+        return masks
+
+    def _mask_list_to_tensor(self, mask_list):
+        """Convert a list of uint8 masks into a batched ComfyUI tensor."""
+        mask_tensor_list = []
+        for mask in mask_list:
+            mask_float = mask.astype(np.float32) / 255.0
+            mask_tensor_list.append(
+                torch.from_numpy(np.expand_dims(mask_float, axis=0))
+            )
+        return torch.cat(mask_tensor_list, dim=0)
     
     def tensor_to_numpy(self, tensor):
         """Convert ComfyUI tensor to numpy array"""
         if len(tensor.shape) == 4:
             tensor = tensor[0]
         numpy_image = tensor.cpu().numpy()
-        if numpy_image.dtype != np.uint8:
-            numpy_image = (numpy_image * 255).astype(np.uint8)
-        return numpy_image
+        return self._to_uint8_image(numpy_image)
     
     def numpy_to_tensor(self, numpy_array):
         """Convert numpy array back to ComfyUI tensor"""
@@ -126,27 +184,17 @@ class FluxKontextDiffMerge:
             numpy_array = numpy_array.astype(np.float32) / 255.0
         if len(numpy_array.shape) == 3:
             numpy_array = np.expand_dims(numpy_array, axis=0)
-        return torch.from_numpy(numpy_array)
+        return torch.from_numpy(np.ascontiguousarray(numpy_array))
     
     def tensor_to_numpy_list(self, tensor):
         """Convert a (batched) ComfyUI tensor to a list of HxWxC uint8 numpy arrays"""
-        # Ensure we are working on CPU
         tensor_cpu = tensor.detach().cpu()
-        # ComfyUI uses NHWC tensors (batch, height, width, channels)
         if len(tensor_cpu.shape) == 4:
-            batch = tensor_cpu.shape[0]
             imgs = []
-            for i in range(batch):
-                img = tensor_cpu[i].numpy()
-                if img.dtype != np.uint8:
-                    img = (img * 255.0).astype(np.uint8)
-                imgs.append(img)
+            for i in range(tensor_cpu.shape[0]):
+                imgs.append(self._to_uint8_image(tensor_cpu[i].numpy()))
             return imgs
-        else:
-            img = tensor_cpu.numpy()
-            if img.dtype != np.uint8:
-                img = (img * 255.0).astype(np.uint8)
-            return [img]
+        return [self._to_uint8_image(tensor_cpu.numpy())]
 
     def numpy_list_to_tensor(self, np_list):
         """Convert list of HxWxC uint8/float numpy arrays to a batched ComfyUI tensor"""
@@ -155,9 +203,9 @@ class FluxKontextDiffMerge:
             if arr.dtype == np.uint8:
                 arr = arr.astype(np.float32) / 255.0
             if len(arr.shape) == 3:
-                arr = np.expand_dims(arr, axis=0)  # Add batch dim
-            tensor_list.append(torch.from_numpy(arr))
-        if len(tensor_list) == 0:
+                arr = np.expand_dims(arr, axis=0)
+            tensor_list.append(torch.from_numpy(np.ascontiguousarray(arr)))
+        if not tensor_list:
             raise ValueError("numpy_list_to_tensor received an empty list")
         return torch.cat(tensor_list, dim=0)
     
@@ -254,11 +302,23 @@ class FluxKontextDiffMerge:
         edit_gray = cv2.cvtColor(edited, cv2.COLOR_RGB2GRAY)
         
         try:
-            score, diff = ssim(orig_gray, edit_gray, full=True, data_range=255)
-        except:
-            diff = np.abs(orig_gray.astype(np.float32) - edit_gray.astype(np.float32)) / 255.0
-        
-        diff_normalized = (diff - diff.min()) / (diff.max() - diff.min() + 1e-8)
+            _, similarity_map = ssim(
+                orig_gray,
+                edit_gray,
+                full=True,
+                data_range=255,
+            )
+            diff_normalized = np.clip(
+                (1.0 - similarity_map.astype(np.float32)) * 0.5,
+                0.0,
+                1.0,
+            )
+        except ValueError:
+            diff_normalized = (
+                np.abs(orig_gray.astype(np.float32) - edit_gray.astype(np.float32))
+                / 255.0
+            )
+
         mask = (diff_normalized > threshold).astype(np.uint8) * 255
         
         return mask
@@ -285,20 +345,25 @@ class FluxKontextDiffMerge:
         # Remove small noise
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         
-        # Expand the mask if requested
         if expand_pixels > 0:
-            expand_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, 
-                                                     (expand_pixels*2+1, expand_pixels*2+1))
+            expand_kernel_size = self._kernel_size(expand_pixels)
+            expand_kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (expand_kernel_size, expand_kernel_size),
+            )
             mask = cv2.dilate(mask, expand_kernel, iterations=1)
         
-        # Gaussian blur for smooth edges
         if blur_amount > 0:
-            mask = cv2.GaussianBlur(mask, (blur_amount*2+1, blur_amount*2+1), 0)
+            blur_kernel_size = self._kernel_size(blur_amount)
+            mask = cv2.GaussianBlur(mask, (blur_kernel_size, blur_kernel_size), 0)
         
-        # Additional feathering
         if feather_amount > 0:
-            mask = cv2.GaussianBlur(mask, (feather_amount*2+1, feather_amount*2+1), 
-                                   feather_amount/3)
+            feather_kernel_size = self._kernel_size(feather_amount)
+            mask = cv2.GaussianBlur(
+                mask,
+                (feather_kernel_size, feather_kernel_size),
+                feather_amount / 3,
+            )
         
         return mask
     
@@ -351,13 +416,12 @@ class FluxKontextDiffMerge:
 
                 center = (cx + pad, cy + pad)
                 result_p = cv2.seamlessClone(src_p, dst_p, msk_p, center, cv2.NORMAL_CLONE)
-                # Crop back to original size
                 result = result_p[pad:pad + h, pad:pad + w]
-                return result
             else:
                 center = (cx, cy)
                 result = cv2.seamlessClone(source, target, binary_mask, center, cv2.NORMAL_CLONE)
-                return result
+
+            return self.alpha_blend(result, target, mask)
 
         except Exception as e:
             print(f"Poisson blending failed: {e}, falling back to alpha blending")
@@ -447,19 +511,17 @@ class FluxKontextDiffMerge:
         tint_color = np.array([255, 100, 100])  # Red tint
         tinted = preview.astype(np.float32) * (1 - mask_3ch * 0.3) + tint_color * mask_3ch * 0.3
         
-        return tinted.astype(np.uint8)
+        return np.clip(tinted, 0, 255).astype(np.uint8)
     
     def merge_diff(self, original_image, edited_image, threshold, detection_method,
                    blend_method, mask_blur, mask_expand, edge_feather, 
                    min_change_area, global_threshold, manual_mask=None):
         """Main entry point – now supports batched inputs"""
-        # Convert input tensors (possibly batched) to lists of numpy images
         original_list = self.tensor_to_numpy_list(original_image)
         edited_list = self.tensor_to_numpy_list(edited_image)
 
         batch_size = len(original_list)
         if batch_size != len(edited_list):
-            # Allow broadcast when original has 1 image and edited has multiple
             if batch_size == 1 and len(edited_list) > 1:
                 print(f"Broadcasting single original image to match edited batch of size {len(edited_list)}")
                 original_list = original_list * len(edited_list)
@@ -467,50 +529,37 @@ class FluxKontextDiffMerge:
             else:
                 raise ValueError(f"Original and edited image batch sizes differ: {batch_size} vs {len(edited_list)}")
 
-        # Prepare manual mask list if provided
-        manual_mask_list = None
-        if manual_mask is not None:
-            # manual_mask tensor shape is likely (B, H, W)
-            manual_mask_np = manual_mask.detach().cpu().numpy()
-            if len(manual_mask_np.shape) == 3:  # Batched masks
-                manual_mask_list = [(manual_mask_np[i] * 255).astype(np.uint8) for i in range(manual_mask_np.shape[0])]
-            else:  # Single mask, broadcast
-                manual_mask_list = [(manual_mask_np * 255).astype(np.uint8)] * batch_size
-            if len(manual_mask_list) != batch_size:
-                # Resize/broadcast to match batch
-                manual_mask_list = (manual_mask_list * batch_size)[:batch_size]
+        manual_mask_list = self._prepare_manual_mask_list(manual_mask, batch_size)
 
-        # Containers for outputs
         result_np_list = []
         mask_np_list = []
         preview_np_list = []
 
-        # Process each item in batch independently
         for idx in range(batch_size):
             original_np = original_list[idx]
             edited_np = edited_list[idx]
 
-            # Ensure images are the same size per item
             if original_np.shape != edited_np.shape:
                 print(f"Resizing edited image in batch index {idx} from {edited_np.shape} to {original_np.shape}")
                 edited_np = cv2.resize(edited_np, (original_np.shape[1], original_np.shape[0]))
 
-            # Handle manual mask if available
             if manual_mask_list is not None:
                 mask = manual_mask_list[idx]
-                # Resize mask if needed
                 if mask.shape != original_np.shape[:2]:
-                    mask = cv2.resize(mask, (original_np.shape[1], original_np.shape[0]))
+                    mask = self._resize_mask(mask, original_np.shape)
             else:
-                # Detect changes
-                mask = self.detect_changes(original_np, edited_np, threshold, detection_method, global_threshold)
+                mask = self.detect_changes(
+                    original_np,
+                    edited_np,
+                    threshold,
+                    detection_method,
+                    global_threshold,
+                )
                 if min_change_area > 0:
                     mask = self.filter_small_changes(mask, min_change_area)
 
-            # Refine mask
             refined_mask = self.refine_mask(mask, mask_expand, mask_blur, edge_feather)
 
-            # Blend based on selected method
             if blend_method == "poisson":
                 result_np = self.poisson_blend(edited_np, original_np, refined_mask)
             elif blend_method == "alpha":
@@ -522,21 +571,14 @@ class FluxKontextDiffMerge:
             else:
                 result_np = self.alpha_blend(edited_np, original_np, refined_mask)
 
-            # Preview diff
             preview_np = self.create_preview_diff(original_np, edited_np, refined_mask)
 
-            # Collect outputs
             result_np_list.append(result_np)
             mask_np_list.append(refined_mask)
             preview_np_list.append(preview_np)
 
-        # Convert outputs back to batched tensors
         result_tensor = self.numpy_list_to_tensor(result_np_list)
-        mask_tensor_list = []
-        for m_np in mask_np_list:
-            m_float = (m_np.astype(np.float32) / 255.0)
-            mask_tensor_list.append(torch.from_numpy(np.expand_dims(m_float, axis=0)))  # add batch dim
-        mask_tensor = torch.cat(mask_tensor_list, dim=0)
+        mask_tensor = self._mask_list_to_tensor(mask_np_list)
         preview_tensor = self.numpy_list_to_tensor(preview_np_list)
 
         return (result_tensor, mask_tensor, preview_tensor)
