@@ -70,6 +70,14 @@ mask_expand: 8
 edge_feather: 15
 ```
 
+If your edited image has a small global position shift, opt into
+`alignment: "translation"` (default is `none`). `max_alignment_shift` defaults
+to 16 pixels along either axis. Alignment requires agreement and improved
+grayscale error in at least four spatially distributed textured tiles; it does
+not handle rotation, zoom, or ambiguous images. Rejected estimates leave the
+edit unaligned. Masks and outputs remain in original-image coordinates, with
+uncovered borders preserved. See the README's alignment policy for full criteria.
+
 ## Quality Comparison
 
 **Before (Standard Flux Kontext):**
@@ -80,8 +88,8 @@ edge_feather: 15
 **After (With Diff Merge):**
 - ✅ Only changed areas processed
 - ✅ Original quality preserved
-- ✅ Handles global AI processing artifacts
-- ✅ No unwanted shifts in unchanged areas
+- ✅ Handles global colour artifacts adaptively
+- ✅ Optional translation alignment for small global position shifts when unchanged regions agree
 
 ## Troubleshooting
 

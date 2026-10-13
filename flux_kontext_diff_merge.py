@@ -35,8 +35,8 @@ class FluxKontextDiffMerge:
     • Mask Expand – Dilate mask by n pixels before blur (helps cover halos).
     • Edge Feather – Extra fine feather after blur for subtle fades.
     • Min Change Area – Ignore isolated specks below this size (pixel²).
-    • Global Threshold – If the entire image shifted (eg colour grade) the
-      adaptive detector automatically relaxes; this scalar lets you tune that.
+    • Global Threshold – If the entire image changed colour, the adaptive
+      detector relaxes; this does not compensate for geometric shifts.
     """
     @classmethod
     def INPUT_TYPES(cls):
@@ -95,11 +95,21 @@ class FluxKontextDiffMerge:
                     "max": 0.5,
                     "step": 0.01,
                     "display": "slider",
-                    "tooltip": "Controls how aggressively the adaptive detector compensates for global shifts"
+                    "tooltip": "Controls adaptive detection of global colour changes, not image position"
                 }),
             },
             "optional": {
                 "manual_mask": ("MASK", {"tooltip": "User-supplied 1-channel mask (black/white) to override automatic detection"}),
+                "alignment": (["none", "translation"], {
+                    "default": "none",
+                    "tooltip": "Optionally align small global translations using agreement between unchanged image tiles"
+                }),
+                "max_alignment_shift": ("INT", {
+                    "default": 16,
+                    "min": 1,
+                    "max": 64,
+                    "tooltip": "Maximum accepted translation in pixels along either axis"
+                }),
             }
         }
     
@@ -136,6 +146,82 @@ class FluxKontextDiffMerge:
             (target_shape[1], target_shape[0]),
             interpolation=cv2.INTER_LINEAR,
         )
+
+    @staticmethod
+    def align_translation(original, edited, max_shift=16):
+        """Align only translations supported by spatially distributed tiles.
+
+        Ambiguous estimates leave the edited image untouched. The returned
+        validity mask marks pixels actually covered by the translated edit.
+        """
+        height, width = original.shape[:2]
+        valid = np.ones((height, width), dtype=bool)
+        if min(height, width) < 96:
+            return edited, valid
+
+        orig_gray = cv2.cvtColor(original, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        edit_gray = cv2.cvtColor(edited, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        tiles = []
+        for row in range(3):
+            for col in range(3):
+                y0, y1 = row * height // 3, (row + 1) * height // 3
+                x0, x1 = col * width // 3, (col + 1) * width // 3
+                orig_tile = orig_gray[y0:y1, x0:x1]
+                edit_tile = edit_gray[y0:y1, x0:x1]
+                if min(orig_tile.std(), edit_tile.std()) < 2.0:
+                    continue
+                window = cv2.createHanningWindow((x1 - x0, y1 - y0), cv2.CV_32F)
+                shift, response = cv2.phaseCorrelate(
+                    orig_tile.copy(), edit_tile.copy(), window)
+                if (np.isfinite(response) and response >= 0.3
+                        and np.all(np.isfinite(shift))
+                        and max(abs(shift[0]), abs(shift[1])) <= max_shift):
+                    tiles.append((row, col, y0, y1, x0, x1, shift))
+
+        if len(tiles) < 4:
+            return edited, valid
+        shifts = np.array([tile[6] for tile in tiles])
+        # Select the largest agreeing group, not an average pulled by edits.
+        distances = np.max(np.abs(shifts[:, None] - shifts[None, :]), axis=2)
+        seed = np.argmax(np.sum(distances <= 1.0, axis=1))
+        inliers = [tile for tile, distance in zip(tiles, distances[seed])
+                   if distance <= 1.0]
+        if (len(inliers) < 4 or len({tile[0] for tile in inliers}) < 2
+                or len({tile[1] for tile in inliers}) < 2):
+            return edited, valid
+        shift = np.median([tile[6] for tile in inliers], axis=0)
+        # Avoid resampling a near-integer shift or numerical identity noise.
+        shift = np.where(np.abs(shift - np.round(shift)) <= 0.15,
+                         np.round(shift), shift)
+        if np.max(np.abs(shift)) < 0.25:
+            return edited, valid
+
+        transform = np.array([[1, 0, -shift[0]], [0, 1, -shift[1]]],
+                             dtype=np.float32)
+        aligned = cv2.warpAffine(edited, transform, (width, height),
+                                 flags=cv2.INTER_LINEAR)
+        coverage = cv2.warpAffine(np.ones((height, width), dtype=np.float32),
+                                  transform, (width, height),
+                                  flags=cv2.INTER_LINEAR)
+        valid = coverage >= 1.0
+        aligned_gray = cv2.cvtColor(aligned, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        improved = []
+        for tile in inliers:
+            row, col, y0, y1, x0, x1, _ = tile
+            overlap = valid[y0:y1, x0:x1]
+            if not np.any(overlap):
+                continue
+            reference = orig_gray[y0:y1, x0:x1][overlap]
+            before = np.mean(np.abs(reference - edit_gray[y0:y1, x0:x1][overlap]))
+            after = np.mean(np.abs(reference - aligned_gray[y0:y1, x0:x1][overlap]))
+            if before > 1.0 and after <= before * 0.8:
+                improved.append((row, col))
+        if (len(improved) < 4 or len({row for row, _ in improved}) < 2
+                or len({col for _, col in improved}) < 2):
+            return edited, np.ones((height, width), dtype=bool)
+
+        aligned[~valid] = original[~valid]
+        return aligned, valid
 
     def _prepare_manual_mask_list(self, manual_mask, batch_size):
         """Normalize manual mask tensors into a per-item uint8 mask list."""
@@ -515,7 +601,8 @@ class FluxKontextDiffMerge:
     
     def merge_diff(self, original_image, edited_image, threshold, detection_method,
                    blend_method, mask_blur, mask_expand, edge_feather, 
-                   min_change_area, global_threshold, manual_mask=None):
+                   min_change_area, global_threshold, manual_mask=None,
+                   alignment="none", max_alignment_shift=16):
         """Main entry point – now supports batched inputs"""
         original_list = self.tensor_to_numpy_list(original_image)
         edited_list = self.tensor_to_numpy_list(edited_image)
@@ -530,6 +617,8 @@ class FluxKontextDiffMerge:
                 raise ValueError(f"Original and edited image batch sizes differ: {batch_size} vs {len(edited_list)}")
 
         manual_mask_list = self._prepare_manual_mask_list(manual_mask, batch_size)
+        if alignment not in ("none", "translation"):
+            raise ValueError(f"Unknown alignment policy: {alignment}")
 
         result_np_list = []
         mask_np_list = []
@@ -542,6 +631,11 @@ class FluxKontextDiffMerge:
             if original_np.shape != edited_np.shape:
                 print(f"Resizing edited image in batch index {idx} from {edited_np.shape} to {original_np.shape}")
                 edited_np = cv2.resize(edited_np, (original_np.shape[1], original_np.shape[0]))
+
+            valid = None
+            if alignment == "translation":
+                edited_np, valid = self.align_translation(
+                    original_np, edited_np, max_alignment_shift)
 
             if manual_mask_list is not None:
                 mask = manual_mask_list[idx]
@@ -559,6 +653,8 @@ class FluxKontextDiffMerge:
                     mask = self.filter_small_changes(mask, min_change_area)
 
             refined_mask = self.refine_mask(mask, mask_expand, mask_blur, edge_feather)
+            if valid is not None:
+                refined_mask[~valid] = 0
 
             if blend_method == "poisson":
                 result_np = self.poisson_blend(edited_np, original_np, refined_mask)
@@ -570,6 +666,9 @@ class FluxKontextDiffMerge:
                 result_np = self.gaussian_blend(edited_np, original_np, refined_mask)
             else:
                 result_np = self.alpha_blend(edited_np, original_np, refined_mask)
+
+            if valid is not None:
+                result_np[~valid] = original_np[~valid]
 
             preview_np = self.create_preview_diff(original_np, edited_np, refined_mask)
 

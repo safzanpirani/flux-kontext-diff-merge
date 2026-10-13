@@ -5,6 +5,7 @@ A ComfyUI custom node that preserves image quality by selectively merging only t
 ## Features
 
 - **Adaptive Detection**: Robust to global AI processing changes using LAB color space
+- **Optional Translation Alignment**: Compensates for small global position shifts when unchanged regions agree
 - **Area Filtering**: Removes small noise areas that aren't real changes
 - **Multiple Detection Methods**: Adaptive, color difference, SSIM, and combined approaches
 - **Multiple Blending Methods**: Poisson, alpha, multi-band, and Gaussian blending
@@ -52,7 +53,7 @@ A ComfyUI custom node that preserves image quality by selectively merging only t
   - `color_diff`: Simple color differences
   - `ssim`: Structural similarity
   - `combined`: Multiple detection methods
-- **`global_threshold`** (0.01-0.5, default: 0.15): Accounts for overall AI processing changes
+- **`global_threshold`** (0.01-0.5, default: 0.15): Accounts for overall colour/lighting changes, not geometric shifts
 - **`min_change_area`** (0-5000, default: 250): Minimum area size for valid changes
 - **`blend_method`**: Choose blending technique
   - **`poisson`**: Best for seamless integration (recommended)
@@ -64,7 +65,9 @@ A ComfyUI custom node that preserves image quality by selectively merging only t
 - **`edge_feather`** (0-50, default: 15): Additional edge softening
 
 #### Optional
-- **`manual_mask`**: Override automatic detection with your own mask
+- **`manual_mask`**: Override automatic detection with your own mask, in original-image coordinates
+- **`alignment`** (`none` / `translation`, default: `none`): Opt into conservative translation registration before detection and blending
+- **`max_alignment_shift`** (1-64, default: 16): Largest accepted translation in pixels along either axis
 
 ### Node Outputs
 - **`merged_image`**: The final quality-preserved image
@@ -79,6 +82,36 @@ This node fully supports batch workflows:
 - If `original_image` has batch size 1 and `edited_image` > 1, the original is automatically broadcast to match the edited batch
 - `manual_mask` may be a single mask (broadcast) or a batch of masks; masks are resized per item to match image dimensions
 - All outputs (`merged_image`, `difference_mask`, `preview_diff`) are returned as batches
+
+### Global position shifts (including Nano Banana edits)
+
+By default, the node compares the images at the same pixel coordinates. Adaptive
+LAB detection compensates for colour changes; it does **not** align geometry.
+For edits shifted a few pixels, choose `alignment: "translation"`. Each batch
+item is registered separately, after any existing resize to the original size.
+The output remains in the original image's coordinate system.
+
+Alignment uses phase correlation on a 3×3 grid of grayscale tiles. A translation
+is accepted only when at least four textured tiles (grayscale standard deviation
+≥2, correlation response ≥0.3) agree within one pixel per axis, span at least two
+rows and two columns, and stay within `max_alignment_shift`. The median of the
+largest agreeing group is validated: at least four supporting tiles spanning two
+rows and columns must each reduce mean absolute grayscale error by at least 20%
+on their covered pixels. This distributed agreement avoids aligning to a single
+repainted or moved object. It assumes substantial unchanged, textured background.
+
+Only translation is supported, not rotation, zoom, perspective, or nonrigid
+deformation. Images smaller than 96 pixels on either axis, low-texture images,
+large edits, repetitive patterns, or weak/ambiguous matches may remain unaligned.
+When the criteria fail, the node uses the edited image as supplied; inspect the
+preview rather than assuming registration succeeded. Leave alignment disabled
+when the intended edit is itself a global translation.
+
+Near-integer estimates (within 0.15 pixels) are snapped to avoid unnecessary
+resampling; other translations use bilinear interpolation. Missing border pixels
+are retained from the original and excluded from the output mask, including
+manual masks and feathering. A manual mask must describe the desired edit in
+**original-image coordinates**, not the shifted edited-image coordinates.
 
 ## Optimal Settings
 
@@ -114,7 +147,7 @@ When Flux Kontext Dev processes an image, it introduces subtle changes throughou
 
 - ✅ Preserves original image quality in unchanged areas
 - ✅ Only applies AI changes where they're actually needed
-- ✅ Handles global AI processing artifacts automatically
+- ✅ Handles global colour artifacts adaptively; small position shifts require optional translation alignment
 - ✅ Provides seamless blending between original and edited regions
 
 ## Requirements
@@ -134,6 +167,10 @@ MIT License - feel free to use and modify for your projects.
 ## Troubleshooting
 
 ### Entire image shows red overlay
+If the edited image is globally displaced, enable `alignment: "translation"`
+first; threshold changes cannot register image positions. See the alignment
+criteria and limitations above.
+
 1. **Increase** `global_threshold` to 0.20+
 2. **Increase** `threshold` to 0.03
 3. **Use** `detection_method: "adaptive"`
@@ -151,6 +188,7 @@ MIT License - feel free to use and modify for your projects.
 
 ## What's New
 
+- Optional conservative translation alignment with distributed tile agreement, error validation, and original-preserving borders
 - Batch processing with original-image broadcasting when edited batch > 1
 - Poisson blending is robust to edge-touching masks (reflect padding) and uses distance-transform center selection
 - Per-parameter tooltips and improved in-node documentation for easier tuning
